@@ -127,6 +127,106 @@ expansion, we generally only want the actual symbol."
       (t (error "This function form is unrecognized: %s" function-form)))))
 
 ;;;; Included parsing functions.
+;;;;; Misc.
+(cl-defun loopy--parse-sub-loop-command ((_ &rest body))
+  "Parse the `loop' or `sub-loop' command.
+
+A sub-loop does not have its own return value, but can have its
+own exit conditions and name.  It does not support special macro
+arguments like `after-do' or `finally-do'.
+
+BODY is one or more loop commands."
+  ;; TODO: There's a lot of repetition between this and the main macro.
+  ;;       Does it make sense to put this repetition in a function instead?
+  (let ((wrapped-loop-name (gensym "sub-loop-"))
+        (wrapped-main-body)
+        (wrapped-latter-body)
+        (wrapped-pre-conditions)
+        (wrapped-post-conditions)
+        (non-wrapped-instructions)
+        (wrapped-skip-used)
+        (wrapped-tagbody-exit-used))
+
+    ;; Process the instructions.
+    (dolist (command body)
+      (if (symbolp command)
+          (setq wrapped-loop-name command)
+        (dolist (instruction (loopy--parse-loop-command command))
+          (cl-case (car instruction)
+            (loopy--pre-conditions
+             (push (cdr instruction) wrapped-pre-conditions))
+            (loopy--main-body
+             (push (cdr instruction) wrapped-main-body))
+            (loopy--latter-body
+             (push (cdr instruction) wrapped-latter-body))
+            (loopy--post-conditions
+             (push (cdr instruction) wrapped-post-conditions))
+            ;; Code for conditionally constructing the loop body.
+            (wrapped-skip-used
+             (setq wrapped-skip-used t))
+            (wrapped-tagbody-exit-used
+             (setq wrapped-tagbody-exit-used t))
+            (t
+             (push instruction non-wrapped-instructions))))))
+
+    ;; Make sure main body is in correct order.
+    (setq wrapped-main-body (nreverse wrapped-main-body))
+
+    ;; Create the sub-loop code.
+    ;; See the main macro `loopy' for a more detailed version of this.
+    (let ((result nil)
+          (result-is-one-expression nil))
+      (cl-flet ((get-result () (if result-is-one-expression
+                                   (list result)
+                                 result)))
+        (setq result wrapped-main-body)
+
+        (when wrapped-skip-used
+          (setq result `(cl-tagbody ,@result loopy--continue-tag)
+                result-is-one-expression t))
+
+        (when wrapped-latter-body
+          (setq result (append result wrapped-latter-body)))
+
+        (when wrapped-post-conditions
+          (setq result
+                (append result
+                        `((unless ,(cl-case (length wrapped-post-conditions)
+                                     (0 t)
+                                     (1 (car wrapped-post-conditions))
+                                     (t (cons 'and wrapped-post-conditions)))
+                            ;; Unlike the normal loop, sub-loops don't have a
+                            ;; return value, so we can just return nil.
+                            (cl-return-from ,wrapped-loop-name nil))))))
+        (setq result `(while ,(cl-case (length wrapped-pre-conditions)
+                                (0 t)
+                                (1 (car wrapped-pre-conditions))
+                                (t (cons 'and wrapped-pre-conditions)))
+                        ;; If using a `cl-tag-body', just insert that one
+                        ;; expression, but if not, break apart into the while
+                        ;; loop's body.
+                        ,@(get-result))
+              ;; Will always be a single expression after wrapping with `while'.
+              result-is-one-expression t)
+
+        (when wrapped-tagbody-exit-used
+          (setq result `(cl-tagbody
+                         ,@(get-result)
+                         wrapped-non-returning-exit-tag)
+                result-is-one-expression t))
+
+        (setq result `(cl-block ,wrapped-loop-name ,@(get-result) nil)
+              ;; Will always be a single expression after wrapping with
+              ;; `cl-block'.
+              result-is-one-expression t)
+
+        (unless result-is-one-expression
+          (push 'progn result)))
+
+      ;; Return the new instructions.
+      (cons `(loopy--main-body . ,result)
+            non-wrapped-instructions))))
+
 ;;;;; Genereric Evaluation
 (cl-defun loopy--parse-expr-command ((_ var &rest vals))
   "Parse the `expr' command.
@@ -750,6 +850,7 @@ COMMAND-LIST."
     (list        . loopy--parse-list-command)
     (list-ref    . loopy--parse-list-ref-command)
     (listf       . loopy--parse-list-ref-command)
+    (loop        . loopy--parse-sub-loop-command)
     (max         . loopy--parse-accumulation-commands)
     (maximize    . loopy--parse-accumulation-commands)
     (min         . loopy--parse-accumulation-commands)
@@ -765,6 +866,8 @@ COMMAND-LIST."
     (seqf        . loopy--parse-seq-ref-command)
     (set         . loopy--parse-expr-command)
     (skip        . loopy--parse-skip-command)
+    (subloop     . loopy--parse-sub-loop-command)
+    (sub-loop    . loopy--parse-sub-loop-command)
     (sum         . loopy--parse-accumulation-commands)
     (unless      . loopy--parse-when-unless-command)
     (until       . loopy--parse-while-until-commands)
